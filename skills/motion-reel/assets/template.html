@@ -1,0 +1,269 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<title>Reel</title>
+<!-- 글꼴: 콘셉트에 맞게 바꾼다. 렌더 전에 document.fonts.ready 를 기다리므로 웹 글꼴을 써도 된다. -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@300;500;800;900&family=JetBrains+Mono:wght@400;700&display=block" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable.min.css" rel="stylesheet">
+<style>
+  :root {
+    /* 팔레트: 브랜드 리서치 결과로 바꾼다. 배경, 전경, 강조 1개, 보조 1~2개. */
+    --bg: #0b0b10;
+    --fg: #f4f1ea;
+    --accent: #ff4d2e;
+    --alt: #3b5bff;
+    --muted: #6b6b78;
+    --display: 'Inter Tight', 'Pretendard Variable', sans-serif;
+    --body: 'Pretendard Variable', 'Inter Tight', sans-serif;
+    --mono: 'JetBrains Mono', monospace;
+  }
+  html, body { margin: 0; background: #000; overflow: hidden; }
+  #stage { position: relative; width: 1920px; height: 1080px; overflow: hidden; background: var(--bg);
+    color: var(--fg); font-family: var(--body); transform-origin: 0 0; }
+  .layer { position: absolute; inset: 0; overflow: hidden; }
+  /* set() 으로 배치하는 요소의 기준점은 부모의 왼쪽 위(0,0)이다. right/bottom 으로 붙일 요소에는 .abs 를 쓰지 않는다. */
+  .abs { position: absolute; left: 0; top: 0; }
+  .center { position: absolute; left: 50%; top: 50%; white-space: nowrap; }
+  .char { display: inline-block; white-space: pre; will-change: transform; }
+  .line-mask { display: block; overflow: hidden; }
+  canvas.fx { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; }
+  #grain { mix-blend-mode: overlay; opacity: .10; }
+  #vignette { position: absolute; inset: 0; pointer-events: none;
+    background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.45) 100%); }
+  #hud { position: fixed; left: 8px; bottom: 8px; font: 12px var(--mono); color: #aaa; z-index: 9; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="world" class="layer"></div>
+  <canvas id="grain" class="fx" width="960" height="540"></canvas>
+  <div id="vignette"></div>
+</div>
+<div id="hud"></div>
+
+<script>
+/* =====================================================================
+   엔진. 모든 시각 상태는 시간 t(초)의 순수 함수로 계산한다.
+   CSS transition/animation, setTimeout, Date.now, 시드 없는 Math.random 을 쓰지 않는다.
+   그래야 렌더러가 임의의 t 에서 같은 프레임을 다시 얻는다.
+   ===================================================================== */
+const W = 1920, H = 1080, FPS = 60, DURATION = 30;   // 기본 30초. 15초는 사용자가 요청할 때만.
+const BPM = 112, BEAT = 60 / BPM, BAR = BEAT * 4;   // 톤 표: 차분 96, 보통 112, 강렬 128. 음악과 컷을 같은 박자 격자에 맞춘다.
+const beat = (n) => n * BEAT;                         // beat(6) = 6번째 박의 시각(초)
+const TOTAL = Math.round(DURATION / BEAT);            // 영상 전체 박 수 (112 BPM 30초 = 56)
+const at = (frac) => beat(Math.round(TOTAL * frac));  // 전체 길이의 비율 → 가장 가까운 박의 시각
+
+// ---------- 수학 ----------
+const clamp = (x, a = 0, b = 1) => Math.min(b, Math.max(a, x));
+const lerp = (a, b, p) => a + (b - a) * p;
+const inv = (a, b, x) => clamp((x - a) / (b - a));
+const E = {
+  linear: p => p,
+  inQuad: p => p * p, outQuad: p => 1 - (1 - p) ** 2,
+  inCubic: p => p ** 3, outCubic: p => 1 - (1 - p) ** 3,
+  inOutCubic: p => p < .5 ? 4 * p ** 3 : 1 - (-2 * p + 2) ** 3 / 2,
+  inQuart: p => p ** 4, outQuart: p => 1 - (1 - p) ** 4,
+  inOutQuart: p => p < .5 ? 8 * p ** 4 : 1 - (-2 * p + 2) ** 4 / 2,
+  inExpo: p => p === 0 ? 0 : 2 ** (10 * p - 10),
+  outExpo: p => p === 1 ? 1 : 1 - 2 ** (-10 * p),
+  inOutExpo: p => p === 0 ? 0 : p === 1 ? 1 : p < .5 ? 2 ** (20 * p - 10) / 2 : (2 - 2 ** (-20 * p + 10)) / 2,
+  outBack: (p, s = 1.70158) => 1 + (s + 1) * (p - 1) ** 3 + s * (p - 1) ** 2,
+  inBack: (p, s = 1.70158) => (s + 1) * p ** 3 - s * p * p,
+  outElastic: p => p === 0 || p === 1 ? p : 2 ** (-10 * p) * Math.sin((p * 10 - .75) * (2 * Math.PI / 3)) + 1,
+  // 무게감 있는 기본 곡선: 빠르게 들어와 길게 감속한다.
+  snap: p => 1 - (1 - p) ** 5,
+};
+// t0 부터 dur 동안 0→1. ease 를 적용한다.
+const tw = (t, t0, dur, ease = E.outExpo) => ease(inv(t0, t0 + dur, t));
+// 들어왔다 나가는 0→1→0
+const inOut = (t, t0, inDur, t1, outDur, ein = E.outExpo, eout = E.inExpo) =>
+  tw(t, t0, inDur, ein) * (1 - tw(t, t1, outDur, eout));
+// 감쇠 스프링. 0→1 로 가며 넘쳤다 돌아온다.
+const spring = (t, t0, { freq = 4.5, damp = 6 } = {}) => {
+  const x = Math.max(0, t - t0);
+  return x <= 0 ? 0 : 1 - Math.exp(-damp * x) * Math.cos(2 * Math.PI * freq * x);
+};
+// 시드 난수
+function rng(seed) { return () => { seed |= 0; seed = seed + 0x6D2B79F5 | 0; let r = Math.imul(seed ^ seed >>> 15, 1 | seed);
+  r = r + Math.imul(r ^ r >>> 7, 61 | r) ^ r; return ((r ^ r >>> 14) >>> 0) / 4294967296; }; }
+// 1D 값 노이즈 (카메라 흔들림 등)
+function noise1(x, seed = 1) { const i = Math.floor(x), f = x - i, h = n => { const r = rng(n * 9301 + seed * 49297)(); return r * 2 - 1; };
+  const u = f * f * (3 - 2 * f); return lerp(h(i), h(i + 1), u); }
+
+// ---------- DOM ----------
+const $ = (html) => { const d = document.createElement('div'); d.innerHTML = html.trim(); return d.firstElementChild; };
+// 변환 문자열. 값은 px/deg. 순서: pre → center → translate → rotate(X,Y,Z) → scale → post
+// 지정하지 않은 키는 생략하고, 0 은 0 으로 적용한다.
+//   pre/post : 앞뒤에 붙일 CSS 변환 문자열 (예: 3D 플립 뒷면의 post: 'rotateY(180deg)')
+//   origin   : transform-origin (예: '50% 100%')
+//   persp    : 이 요소 자신에 거는 perspective(px). 자식에 원근을 주려면 CSS perspective 를 쓴다.
+function set(el, o = {}) {
+  const has = k => o[k] !== undefined;
+  const tr = [];
+  if (o.pre) tr.push(o.pre);
+  if (o.persp) tr.push(`perspective(${o.persp}px)`);
+  if (o.center) tr.push('translate(-50%,-50%)');
+  if (has('x') || has('y') || has('z')) tr.push(`translate3d(${o.x || 0}px,${o.y || 0}px,${o.z || 0}px)`);
+  if (has('rx')) tr.push(`rotateX(${o.rx}deg)`);
+  if (has('ry')) tr.push(`rotateY(${o.ry}deg)`);
+  if (has('r') || has('rz')) tr.push(`rotate(${o.r ?? o.rz}deg)`);
+  if (has('s') || has('sx') || has('sy')) tr.push(`scale(${o.sx ?? o.s ?? 1},${o.sy ?? o.s ?? 1})`);
+  if (o.post) tr.push(o.post);
+  el.style.transform = tr.join(' ');
+  if (has('origin')) el.style.transformOrigin = o.origin;
+  if (has('o')) el.style.opacity = o.o;
+  if (has('blur')) el.style.filter = o.blur > 0.05 ? `blur(${o.blur}px)` : 'none';
+  if (has('clip')) el.style.clipPath = o.clip;
+  return el;
+}
+// 글자/단어 분리. 반환값은 span 배열.
+function split(el, mode = 'chars') {
+  const text = el.textContent; el.textContent = '';
+  const parts = mode === 'words' ? text.split(/(\s+)/) : [...text];
+  return parts.map(p => { const s = document.createElement('span'); s.className = 'char'; s.textContent = p; el.appendChild(s); return s; });
+}
+// 사각 마스크 리빌. p: 0→1, dir: 'up'|'down'|'left'|'right'
+const wipe = (p, dir = 'up') => {
+  const q = (1 - p) * 100;
+  return { up: `inset(${q}% 0 0 0)`, down: `inset(0 0 ${q}% 0)`, left: `inset(0 ${q}% 0 0)`, right: `inset(0 0 0 ${q}%)` }[dir];
+};
+// 숫자 카운트업 문자열
+const count = (p, to, { decimals = 0, prefix = '', suffix = '' } = {}) =>
+  prefix + (to * p).toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals }) + suffix;
+// 해독 효과: p 가 커질수록 앞에서부터 원문이 드러난다.
+function scramble(text, p, seed = 3, glyphs = '!<>-_\\/[]{}—=+*^?#ABCDEFGHJKLMNPQRSTUVWXYZ0123456789') {
+  const r = rng(seed + Math.floor(p * 30));
+  return [...text].map((c, i) => c === ' ' ? ' ' : (i / text.length < p ? c : glyphs[Math.floor(r() * glyphs.length)])).join('');
+}
+
+// ---------- 장면 ----------
+const world = document.getElementById('world');
+const scenes = [];
+/** scene(시작초, 끝초, { build(root) → 상태, update(lt, st, t, p) })
+ *  lt: 장면 내부 시각, p: 장면 진행률 0..1. 장면 밖 시간에는 레이어를 숨긴다.
+ *  전환이 겹치게 하려면 장면 구간을 서로 겹쳐 정의한다. z 로 쌓임 순서를 정한다. */
+function scene(start, end, def) {
+  const root = document.createElement('div'); root.className = 'layer'; root.style.zIndex = def.z || scenes.length;
+  world.appendChild(root);
+  const st = def.build ? def.build(root) : {};
+  scenes.push({ start, end, root, st, update: def.update });
+}
+
+// ---------- 소리 큐 ----------
+// render.mjs --dump-cues 가 이 값을 읽어 scripts/sfx.py 에 넘긴다. 화면의 사건과 같은 시각 상수로 작성한다.
+const cues = [];
+const cue = (t, type, extra = {}) => cues.push({ t: +t.toFixed(4), type, ...extra });
+
+/* =====================================================================
+   ▼▼▼ 작업 구역 시작. 이 아래부터 '작업 구역 끝'까지를 영상마다 새로 쓴다. ▼▼▼
+   엔진 코드(위)와 후처리·렌더 코드(아래)는 고치지 않아도 된다.
+   ===================================================================== */
+
+// 음악 구간: SKILL.md 의 구성 비율(훅 12%, 전환 19%, 본론 38%, 증거 12%, 결말 19%)에 맞춘 기본값.
+// BPM 을 바꿔도 비율로 계산되므로 박에 맞는다. 증거 직전 1박은 비트를 빼고 riser 큐를 둔다. 스토리보드에 맞게 고친다.
+const music = {
+  bpm: BPM, key: 'A', scale: 'minor', progression: [0, 5, 3, 4], gain: 0.8,
+  energy: 'mid',   // low | mid | high. SKILL.md 의 톤 표를 따른다.
+  sections: [
+    { from: 0, to: at(0.125), pad: true },
+    { from: at(0.125), to: at(0.6875) - BEAT, kick: true, hat: true, clap: true, bass: true, pad: true },
+    { from: at(0.6875) - BEAT, to: at(0.6875), pad: true },
+    { from: at(0.6875), to: at(0.8125), kick: true, hat: true, bass: true, pad: true },
+    { from: at(0.8125), to: DURATION, kick: true, bass: true, pad: true },
+  ],
+};
+
+// 카메라: world 전체에 거는 변환. IMPACTS 의 각 시각에 짧은 흔들림, PUNCHES 의 각 시각에 줌 펀치를 준다.
+const IMPACTS = [0];          // 예: [0, beat(10), beat(26)]
+const PUNCHES = [];           // 예: 기능 구간의 킥 박자 [beat(10), beat(14), beat(18)]
+function camera(t) {
+  let shake = 0, punch = 0;
+  for (const it of IMPACTS) shake += 8 * inOut(t, it, 0.04, it + 0.04, 0.5);
+  for (const pt of PUNCHES) punch += 0.03 * (1 - tw(t, pt, 0.3, E.outCubic)) * (t >= pt ? 1 : 0);
+  return { x: noise1(t * 30, 1) * shake, y: noise1(t * 30, 2) * shake, s: 1 + punch };
+}
+
+// ---- 예시 장면: 엔진 사용법을 보이기 위한 것이다. 지우고 스토리보드대로 새로 짠다. ----
+scene(0, beat(9), {
+  build(root) {
+    const title = $(`<div class="center" style="font:900 220px/0.9 var(--display);letter-spacing:-0.04em">MOTION</div>`);
+    root.appendChild(title);
+    return { title, chars: split(title) };
+  },
+  update(lt, st) {
+    set(st.title, { center: true, s: lerp(1.15, 1, tw(lt, 0, 3, E.outCubic)) });
+    st.chars.forEach((c, i) => {
+      const p = tw(lt, 0.2 + i * 0.05, 0.9, E.snap);
+      set(c, { y: lerp(260, 0, p), r: lerp(14, 0, p), o: p });
+    });
+  },
+});
+scene(beat(8), DURATION, {
+  build(root) {
+    const panel = $(`<div class="layer" style="background:var(--accent)"></div>`);
+    const word = $(`<div class="center" style="font:800 120px var(--display);color:var(--bg)"></div>`);
+    root.append(panel, word);
+    return { panel, word };
+  },
+  update(lt, st) {
+    set(st.panel, { clip: wipe(tw(lt, 0, 0.6, E.inOutExpo), 'up') });
+    st.word.textContent = scramble('BUILT FRAME BY FRAME', tw(lt, 0.4, 1.2, E.linear));
+    set(st.word, { center: true, o: tw(lt, 0.4, 0.2) });
+  },
+});
+cue(0, 'impact'); cue(beat(6), 'riser', { len: beat(2) }); cue(beat(8), 'whoosh', { len: 0.5 }); cue(beat(9), 'type', { len: 1.1 });
+
+/* =====================================================================
+   ▲▲▲ 작업 구역 끝 ▲▲▲
+   ===================================================================== */
+
+/* =====================================================================
+   후처리: 필름 그레인. 프레임 번호로 시드를 정하므로 결정적이다.
+   ===================================================================== */
+const grain = document.getElementById('grain'), gctx = grain.getContext('2d');
+const grainTiles = [...Array(6)].map((_, k) => {
+  const img = gctx.createImageData(grain.width, grain.height), r = rng(k + 11);
+  for (let i = 0; i < img.data.length; i += 4) { const v = r() * 255; img.data[i] = img.data[i + 1] = img.data[i + 2] = v; img.data[i + 3] = 255; }
+  return img;
+});
+
+function renderFrame(t) {
+  for (const s of scenes) {
+    const on = t >= s.start && t < s.end;
+    s.root.style.display = on ? '' : 'none';
+    if (on) s.update(t - s.start, s.st, t, inv(s.start, s.end, t));
+  }
+  const c = camera(t);
+  set(world, { x: c.x, y: c.y, s: c.s ?? 1, r: c.r || 0 });
+  gctx.putImageData(grainTiles[Math.floor(t * FPS) % grainTiles.length], 0, 0);
+  const hud = document.getElementById('hud'); if (hud) hud.textContent = `${t.toFixed(2)}s`;
+}
+
+// ?render=1 (render.mjs 가 붙인다) 이면 미리보기 HUD 를 제거하고 실시간 재생을 하지 않는다.
+const ready = document.fonts.ready;
+window.__reel = { W, H, FPS, DURATION, ready, renderFrame, cues, music };
+
+/* ---------- 미리보기: 브라우저에서 파일을 열면 실시간 재생한다 ----------
+   스페이스 정지/재생, ←/→ 0.1초 이동, ?t=3.2 로 특정 시각 고정. */
+(function preview() {
+  const q = new URLSearchParams(location.search);
+  if (q.has('render')) { document.getElementById('hud').remove(); return; }
+  const fit = () => { const k = Math.min(innerWidth / W, innerHeight / H); document.getElementById('stage').style.transform = `scale(${k})`; };
+  addEventListener('resize', fit); fit();
+  let t = q.has('t') ? +q.get('t') : 0, playing = !q.has('t'), last = null;
+  addEventListener('keydown', e => {
+    if (e.code === 'Space') playing = !playing;
+    if (e.code === 'ArrowRight') t = Math.min(DURATION, t + 0.1);
+    if (e.code === 'ArrowLeft') t = Math.max(0, t - 0.1);
+  });
+  ready.then(() => requestAnimationFrame(function loop(now) {
+    if (playing && last !== null) t = (t + (now - last) / 1000) % DURATION;
+    last = now; renderFrame(t); requestAnimationFrame(loop);
+  }));
+})();
+</script>
+</body>
+</html>

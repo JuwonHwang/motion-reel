@@ -1,0 +1,9 @@
+{
+  "name": "motion-reel",
+  "version": "0.1.0",
+  "description": "서비스 홍보나 사내 프로젝트 소개용 15~30초 모션 그래픽 영상(MP4)을 리서치부터 렌더까지 만드는 스킬",
+  "author": {
+    "name": "JuwonHwang"
+  },
+  "license": "MIT"
+}

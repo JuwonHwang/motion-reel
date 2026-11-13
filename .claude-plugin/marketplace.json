@@ -1,0 +1,13 @@
+{
+  "name": "motion-reel",
+  "owner": {
+    "name": "JuwonHwang"
+  },
+  "description": "서비스 홍보나 사내 프로젝트 소개용 모션 그래픽 영상(MP4)을 만드는 Claude Code 플러그인",
+  "plugins": [
+    {
+      "name": "motion-reel",
+      "source": "./"
+    }
+  ]
+}
